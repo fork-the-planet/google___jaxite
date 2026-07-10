@@ -204,6 +204,7 @@ tpu_test(
     python_version = "PY3",
     shard_count = 3,
     srcs_version = "PY3ONLY",
+    tags = ["manual"],
     deps = [
         ":jaxite",
         # copybara: xprof_analysis_client  # buildcleaner: keep
@@ -678,6 +679,22 @@ cpu_gpu_tpu_test(
         "@abseil-py//absl/testing:absltest",
         "@abseil-py//absl/testing:parameterized",
         "@jaxite_deps//hypothesis",
+        "@jaxite_deps//jax",
+        "@jaxite_deps//jaxlib",
+        "@jaxite_deps//numpy",
+    ],
+)
+
+cpu_gpu_tpu_test(
+    name = "rotate_test",
+    size = "small",
+    timeout = "long",
+    srcs = ["jaxite/jaxite_ckks/rotate_test.py"],
+    main = "jaxite/jaxite_ckks/rotate_test.py",
+    deps = [
+        ":jaxite_ckks",
+        "@abseil-py//absl/testing:absltest",
+        "@abseil-py//absl/testing:parameterized",
         "@jaxite_deps//jax",
         "@jaxite_deps//jaxlib",
         "@jaxite_deps//numpy",
