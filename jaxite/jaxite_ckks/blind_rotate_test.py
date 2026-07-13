@@ -198,6 +198,115 @@ class BlindRotateTest(parameterized.TestCase):
       self.assertAlmostEqual(e.imag, d.imag, delta=1.5)
 
   @parameterized.named_parameters(
+      ("secret_idx_0_theta_2", 4, 0, 2),
+      ("secret_idx_1_theta_2", 4, 1, 2),
+      ("secret_idx_2_theta_2", 4, 2, 2),
+      ("secret_idx_3_theta_2", 4, 3, 2),
+      ("secret_idx_5_theta_4", 8, 5, 4),
+      ("secret_idx_9_theta_4", 16, 9, 4),
+      ("dense_8_slots_theta_4", 8, 7, 4),
+      ("case_16_3_8", 16, 3, 8),
+      ("case_16_15_2", 16, 15, 2),
+      ("case_64_55_16", 64, 55, 16),
+      ("dense_512_slots_theta_16", 512, 123, 16),
+  )
+  def test_brot_hybrid(self, num_slots, secret_idx, theta):
+    degree = max(1024, 2 * num_slots)
+    r = 32
+    q_limbs = [1073184769]
+    p_limbs = [1073479681]
+    all_moduli = q_limbs + p_limbs
+    scale = 2**22
+
+    # 1. Generate keys
+    test_random_source = random.ZeroNoiseRandomSource()
+    _, sk_q = key_gen.keygen(degree, q_limbs, random_source=test_random_source)
+
+    # Generate hybrid key under PQ, with s_j = 1
+    cmkey_hybrid, mmkey_hybrid = key_gen.gen_hybrid_key(
+        sk=sk_q,
+        j=secret_idx,
+        idx=secret_idx,
+        s_j=1,
+        theta=theta,
+        q_limbs=q_limbs,
+        p_limbs=p_limbs,
+        random_source=test_random_source,
+    )
+
+    # 2. Define input message w1 and w2 (slots)
+    #
+    # To test the algebraic correctness of `brot_hybrid` (Algorithm 4) in isolation,
+    # we verify its underlying linear combination property.
+    # For a secret index j with value s_j = 1, `gen_hybrid_key` embeds rotation
+    # masks m^{(k)} and the giant-step/baby-step decomposition of j into the keys.
+    # When `brot_hybrid` is executed, it homomorphically evaluates:
+    #   ct_out = sum_k m^{(k)} * roll(pt_k, j)
+    # Decrypting ct_out yields the masked linear combination of the rolled slot vectors:
+    #   expected = mask_base * roll(w1, j) + (1 - mask_base) * roll(conj(w2), j)
+    # This verifies that the giant-step column multiplication and baby-step MUX-based
+    # rotations correctly align, shift, and combine the slot components.
+    w1 = np.array(
+        [complex(x % 4 + 1, x % 4 + 2) for x in range(num_slots)], dtype=complex
+    )
+    w2 = np.array(
+        [complex(x % 3 + 3, x % 3 + 1) for x in range(num_slots)], dtype=complex
+    )
+
+    reps = degree // (2 * num_slots)
+    w1_full = np.tile(w1, reps)
+    w2_full = np.tile(w2, reps)
+
+    encoder_pq = encode.Encode(degree, all_moduli, scale)
+    pt1 = encoder_pq.encode(w1_full.tolist())
+    pt2 = encoder_pq.encode(np.conj(w1_full).tolist())
+    pt3 = encoder_pq.encode(w2_full.tolist())
+    pt4 = encoder_pq.encode(np.conj(w2_full).tolist())
+    pts = [pt1, pt2, pt4, pt3]
+
+    # 3. Run homomorphic BRotHybrid using BlindRotation kernel class
+    brot_kernel = blind_rotate.BlindRotation()
+    brot_kernel.precompute_constants(
+        q_limbs=q_limbs,
+        p_limbs=p_limbs,
+        dnum=1,
+        r=r,
+        c=degree // r,
+        num_rescales=1,
+    )
+
+    ct_res = brot_kernel.brot_hybrid(
+        pts=pts,
+        cmkey_hybrid=cmkey_hybrid,
+        mmkey_hybrid=mmkey_hybrid,
+        theta=theta,
+        p_limbs=jnp.array(p_limbs, dtype=jnp.uint32),
+        control_index=0,
+    )
+
+    # 4. Decrypt and verify result
+    decryptor_q = encrypt.Decrypt(sk_q)
+    pt_dec = decryptor_q.decrypt(ct_res)
+
+    decoder = encode.Decode(scale, num_slots)
+    decoded = decoder.decode(pt_dec)
+    full_slots = degree // 2
+    reps = degree // (2 * num_slots)
+    w1_full = np.tile(w1, reps)
+    w2_full = np.tile(np.conj(w2), reps)
+    rot_amount = int(secret_idx % full_slots)
+    mask_base = np.zeros(full_slots, dtype=complex)
+    mask_base[rot_amount:] = 1.0
+    expected_full = mask_base * _cyclic_roll(w1_full, secret_idx) + (
+        1.0 - mask_base
+    ) * _cyclic_roll(w2_full, secret_idx)
+    expected = expected_full[:num_slots]
+
+    for e, d in zip(expected, decoded):
+      self.assertAlmostEqual(e.real, d.real, delta=1.5)
+      self.assertAlmostEqual(e.imag, d.imag, delta=1.5)
+
+  @parameterized.named_parameters(
       ("slots_4_r_1", 4, 1),
       ("slots_4_r_2", 4, 2),
       ("slots_8_r_3", 8, 3),
@@ -338,6 +447,17 @@ class BlindRotationHypothesisTest(absltest.TestCase):
         p_limbs=cls.P_LIMBS,
         random_source=cls.test_random_source,
     )
+    # 3. Hybrid key
+    cls.cmkey_hybrid, cls.mmkey_hybrid = key_gen.gen_hybrid_key(
+        sk=cls.sk_q,
+        j=cls.SECRET_IDX,
+        idx=cls.SECRET_IDX,
+        s_j=1,
+        theta=cls.THETA,
+        q_limbs=cls.Q_LIMBS,
+        p_limbs=cls.P_LIMBS,
+        random_source=cls.test_random_source,
+    )
 
     # Setup BlindRotation kernel
     cls.brot_kernel = blind_rotate.BlindRotation()
@@ -418,6 +538,59 @@ class BlindRotationHypothesisTest(absltest.TestCase):
     mu_full = np.zeros(self.DEGREE // 2, dtype=complex)
     mu_full[: self.NUM_SLOTS] = mu
     expected_full = _cyclic_roll(mu_full, self.SECRET_IDX)
+    expected = expected_full[: self.NUM_SLOTS]
+
+    for e, d in zip(expected, decoded):
+      self.assertAlmostEqual(e.real, d.real, delta=1.5)
+      self.assertAlmostEqual(e.imag, d.imag, delta=1.5)
+
+  @hypothesis.settings(max_examples=10, deadline=None)
+  @hypothesis.given(
+      w1_slots=st.lists(
+          st.complex_numbers(min_magnitude=0, max_magnitude=5),
+          min_size=8,
+          max_size=8,
+      ),
+      w2_slots=st.lists(
+          st.complex_numbers(min_magnitude=0, max_magnitude=5),
+          min_size=8,
+          max_size=8,
+      ),
+  )
+  def test_brot_hybrid_hypothesis(self, w1_slots, w2_slots):
+    w1 = np.array(w1_slots, dtype=complex)
+    w2 = np.array(w2_slots, dtype=complex)
+
+    pt1 = self.encoder_pq.encode(w1.tolist())
+    pt2 = self.encoder_pq.encode(np.conj(w1).tolist())
+    pt3 = self.encoder_pq.encode(w2.tolist())
+    pt4 = self.encoder_pq.encode(np.conj(w2).tolist())
+    pts = [pt1, pt2, pt4, pt3]
+
+    ct_res = self.brot_kernel.brot_hybrid(
+        pts=pts,
+        cmkey_hybrid=self.cmkey_hybrid,
+        mmkey_hybrid=self.mmkey_hybrid,
+        theta=self.THETA,
+        p_limbs=jnp.array(self.P_LIMBS, dtype=jnp.uint32),
+        control_index=0,
+    )
+
+    pt_dec = self.decryptor_q.decrypt(ct_res)
+    decoded = self.decoder.decode(pt_dec)
+
+    w1_full = np.zeros(self.NUM_SLOTS, dtype=complex)
+    w1_full[: self.NUM_SLOTS] = w1
+    w2_full = np.zeros(self.NUM_SLOTS, dtype=complex)
+    w2_full[: self.NUM_SLOTS] = np.conj(w2)
+
+    rot_amount = int(self.SECRET_IDX % self.NUM_SLOTS)
+    mask_base = np.zeros(self.NUM_SLOTS, dtype=complex)
+    mask_base[rot_amount:] = 1.0
+
+    expected_full = mask_base * _cyclic_roll(w1_full, self.SECRET_IDX) + (
+        1.0 - mask_base
+    ) * _cyclic_roll(w2_full, self.SECRET_IDX)
     expected = expected_full[: self.NUM_SLOTS]
 
     for e, d in zip(expected, decoded):

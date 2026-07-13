@@ -1,6 +1,7 @@
 """Key generation utilities for CKKS."""
 
 import math
+
 import jax.numpy as jnp
 from jaxite.jaxite_ckks import blind_rotate_utils
 from jaxite.jaxite_ckks import encode
@@ -19,19 +20,23 @@ def keygen(
     moduli: list[int],
     random_source: random.RandomSource | None = None,
     hamming_weight: int | None = None,
+    sk: SecretKey | None = None,
 ) -> tuple[PublicKey, SecretKey]:
   """Generate a public, secret key pair."""
   random_source = random_source or random.SecureRandomSource()
 
-  if hamming_weight is not None:
+  if sk is not None:
+    s_ntt = sk.data
+  elif hamming_weight is not None:
     s = random_source.gen_sparse_binary(degree, hamming_weight, moduli)
+    s_ntt = ntt_cpu.ntt_negacyclic_poly(s, moduli)
   else:
     s = random_source.gen_ternary_poly(degree, moduli)
+    s_ntt = ntt_cpu.ntt_negacyclic_poly(s, moduli)
 
   a = random_source.gen_uniform_poly(degree, moduli)
   e = random_source.gen_gaussian_poly(degree, moduli)
 
-  s_ntt = ntt_cpu.ntt_negacyclic_poly(s, moduli)
   a_ntt = ntt_cpu.ntt_negacyclic_poly(a, moduli)
   e_ntt = ntt_cpu.ntt_negacyclic_poly(e, moduli)
 
@@ -298,30 +303,23 @@ def gen_hmuxrot_key(
       p_limbs=p_limbs,
       dnum=1,
       random_source=random_source,
-      dest_key_ext=dest_sk_ext,
   )
   key0 = types.Ciphertext(
       data=jnp.stack([ksk.b[0], ksk.a[0]]),
       moduli=ksk.moduli,
   )
 
-  # key1 encrypts P * beta under sk. Since this is a constant polynomial and not
   # a secret key, we perform direct symmetric encryption inline.
-  target1 = np.ones((degree, len(all_moduli)), dtype=np.uint64) * scaled_val0
-  target1 = target1 % all_moduli_u64
-
-  a_coeffs = random_source.gen_uniform_poly(degree, all_moduli)
-  e_coeffs = random_source.gen_gaussian_poly(degree, all_moduli)
-  a_slots = ntt_cpu.ntt_negacyclic_poly(a_coeffs, all_moduli)
-  e_slots = ntt_cpu.ntt_negacyclic_poly(e_coeffs, all_moduli)
-
-  prod = (a_slots * dest_sk_ext.data) % all_moduli_u64
-  b_slots = (e_slots + target1 + all_moduli_u64 - prod) % all_moduli_u64
-
-  key1 = types.Ciphertext(
-      data=jnp.array(np.stack([b_slots, a_slots]), dtype=jnp.uint32),
+  pk_ext, _ = keygen(degree, all_moduli, random_source, sk=dest_sk_ext)
+  encryptor = encrypt.Encrypt(pk_ext)
+  target1_data = (
+      np.ones((degree, len(all_moduli)), dtype=np.uint64) * scaled_val0
+  ) % all_moduli_u64
+  plain_target1 = types.Plaintext(
+      data=jnp.array(target1_data, dtype=jnp.uint32),
       moduli=jnp.array(all_moduli, dtype=jnp.uint32),
   )
+  key1 = encryptor.encrypt(plain_target1, random_source)
 
   return types.HMuxRotKey(key0, key1)
 
@@ -400,3 +398,100 @@ def gen_rotation_key(
       dnum=dnum,
       random_source=random_source,
   )
+
+
+def gen_hybrid_key(
+    sk: types.SecretKey,
+    j: int,
+    idx: int,
+    s_j: int,
+    theta: int,
+    q_limbs: list[int],
+    p_limbs: list[int],
+    random_source: random.RandomSource | None = None,
+) -> tuple[list[list[types.Ciphertext]], types.MuxRotationKey]:
+  """Generates the hybrid evaluation keys (giant steps and baby steps) for a secret index j."""
+  random_source = random_source or random.SecureRandomSource()
+  degree = sk.data.shape[0]
+  num_slots = degree // 2
+  num_giant_steps = num_slots // theta
+  all_moduli = q_limbs + p_limbs
+
+  sk_ext = extend_secret_key(sk, all_moduli)
+
+  j_1 = j // theta
+  j_0 = j % theta
+
+  # 1. Generate MuxRotationKey for the giant steps (j_1)
+  num_bits = int(np.log2(num_giant_steps))
+  j1_bits = [int((j_1 >> k) & 1) for k in range(num_bits)]
+  mmkey_hybrid = gen_mux_rotation_key(
+      sk=sk,
+      secret_bits=j1_bits,
+      q_limbs=q_limbs,
+      p_limbs=p_limbs,
+      random_source=random_source,
+      stride=theta,
+  )
+
+  # 2. Compute the 4 masks m^{(k)}
+  m_size = num_slots
+  mask_base = np.zeros(m_size, dtype=complex)
+  j_mod = j % m_size
+  mask_base[j_mod:] = 1.0
+
+  s_pos = (1 + s_j) // 2
+  s_neg = (1 - s_j) // 2
+
+  # Order the masks to align with the plaintexts order in bootstrapping:
+  # - masks[0]: first half, positive (goes with pt1 / pts[0])
+  # - masks[1]: first half, negative/conjugate (goes with pt2 / pts[1])
+  # - masks[2]: second half, positive (goes with pt3 / pts[2])
+  # - masks[3]: second half, negative/conjugate (goes with pt4 / pts[3])
+  if idx < m_size:
+    masks = [
+        s_pos * mask_base,
+        s_neg * mask_base,
+        s_pos * (1.0 - mask_base),
+        s_neg * (1.0 - mask_base),
+    ]
+  else:
+    # Under cyclotomic relation sign flip (second half), the positive
+    # and negative components for the second-half plaintexts are swapped.
+    masks = [
+        s_neg * (1.0 - mask_base),
+        s_pos * (1.0 - mask_base),
+        s_neg * mask_base,
+        s_pos * mask_base,
+    ]
+
+  # 3. Rotate the masks by -j_1 * theta
+  rotated_masks = [np.roll(m_k, -j_1 * theta) for m_k in masks]
+
+  # 4. Encrypt the giant-step keys under PQ
+  p_val = math.prod(p_limbs)
+
+  encoder_pq = encode.Encode(degree, all_moduli, float(p_val))
+
+  all_zeroes = [complex(0)] * num_slots
+  plain_0 = encoder_pq.encode(all_zeroes)
+
+  pk_ext, _ = keygen(degree, all_moduli, random_source, sk=sk_ext)
+  encryptor = encrypt.Encrypt(pk_ext)
+
+  cmkey_hybrid = []
+  for k in range(4):
+    cmkey_hybrid_k = []
+    plain_mask = encoder_pq.encode(rotated_masks[k].tolist())
+
+    for baby_step in range(theta):
+      if baby_step == j_0:
+        target = plain_mask
+      else:
+        target = plain_0
+
+      ct = encryptor.encrypt(target, random_source)
+      cmkey_hybrid_k.append(ct)
+    cmkey_hybrid.append(cmkey_hybrid_k)
+
+  return cmkey_hybrid, mmkey_hybrid

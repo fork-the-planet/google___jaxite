@@ -277,3 +277,85 @@ class BlindRotation:
     # Algorithm 2, Step 7: return Rescale_P(ct)
     self.rescale_kernel.rescale(ct_out)
     return ct_out
+
+  def brot_hybrid(
+      self,
+      pts: list[types.Plaintext] | tuple[types.Plaintext, ...],
+      cmkey_hybrid: list[list[types.Ciphertext]],
+      mmkey_hybrid: types.MuxRotationKey,
+      theta: int,
+      p_limbs: jax.Array,
+      control_index: int = 0,
+  ) -> types.Ciphertext:
+    """Homomorphic Blind Rotation using the Hybrid Method (BRotHybrid)."""
+    if len(pts) != 4:
+      raise ValueError("pts must contain exactly 4 Plaintexts.")
+    if len(cmkey_hybrid) != 4:
+      raise ValueError(
+          "cmkey_hybrid must contain exactly 4 lists of Ciphertexts."
+      )
+
+    degree = pts[0].data.shape[0]
+
+    # Algorithm 4, Step 1: ct <- (0, 0)
+    # Stacking and batching all products to perform a single modular reduction later.
+    products = []
+    # Algorithm 4, Step 2: for k from 1 to 4 do
+    for k in range(4):
+      pt_k = pts[k]
+      cmkeys_k = cmkey_hybrid[k]
+
+      if len(cmkeys_k) != theta:
+        raise ValueError(
+            f"cmkey_hybrid[{k}] must have length equal to theta ({theta})."
+        )
+
+      # Note: Swapped baby/giant step layout (Approach B, Section 5.4 of paper).
+      # Algorithm 4, Step 3 (swapped): for j0 (baby step) from 0 to theta - 1 do
+      gs = jnp.array(
+          [int(pow(5, -j0, 2 * degree)) for j0 in range(theta)],
+          dtype=jnp.uint32,
+      )
+      # Algorithm 4, Step 4 (swapped): pt_k(X^{5^{-j0}}) * CM_key_j0
+      pt_rot_all = jax.vmap(
+          blind_rotate_utils.apply_automorphism_ntt, in_axes=(None, 0)
+      )(pt_k.data, gs)
+      pt_rot_all_expanded = jnp.expand_dims(pt_rot_all, axis=1)
+
+      ct_data_all = jnp.stack([ct.data for ct in cmkeys_k], axis=0)
+
+      batch_ct = types.Ciphertext(data=ct_data_all, moduli=cmkeys_k[0].moduli)
+      batch_pt = types.Plaintext(data=pt_rot_all_expanded, moduli=pt_k.moduli)
+
+      batch_ct_mul = self.mul_kernel.mul(batch_ct, batch_pt)
+      products.append(batch_ct_mul.data)
+
+    # Stack and sum all products along the batch and k axes
+    all_products = jnp.stack(products, axis=0)
+    summed_data = jnp.sum(all_products.astype(jnp.uint64), axis=(0, 1))
+
+    # Modular reduction on the accumulated sum
+    reduced_data = barrett.modular_reduction(
+        summed_data, self.mul_kernel.barrett_constants
+    )
+
+    ct_giant = types.Ciphertext(
+        data=reduced_data.astype(jnp.uint32),
+        moduli=cmkey_hybrid[0][0].moduli,
+    )
+
+    # Algorithm 4, Step 7: ct <- Rescale_P(ct)
+    # Rescale by P to go back to modulus Q
+    self.rescale_kernel.rescale(ct_giant)
+
+    # Note: Swapped baby/giant step layout (Approach B, Section 5.4 of paper).
+    # Algorithm 4, Step 8 (swapped): return BRotMux(mmkey, ct) for giant steps
+    # index j1 * theta, using stride = theta.
+    # Run Mux Method conditional rotations on the giant-step output, with stride=theta
+    return self.brot_mux(
+        ct_in=ct_giant,
+        mux_key=mmkey_hybrid,
+        p_limbs=p_limbs,
+        control_index=control_index,
+        stride=theta,
+    )
